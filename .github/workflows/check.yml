@@ -2,7 +2,7 @@ name: Stampede Checker
 
 on:
   schedule:
-    - cron: "*/2 * * * *"  # run every 2 minutes
+    - cron: "*/2 * * * *"  # every 2 minutes
   workflow_dispatch:
 
 jobs:
@@ -10,9 +10,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Restore previous state
+      - name: Restore last snapshot
+        uses: actions/cache@v4
+        with:
+          path: last.json
+          key: stampede-last-state
+
       - name: Run Checker
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-        run: |
-          node stampede-checker.mjs
+        run: node stampede-checker.mjs
+
+      # Save updated snapshot for next run
+      - name: Save last snapshot
+        uses: actions/cache/save@v4
+        with:
+          path: last.json
+          key: stampede-last-state
