@@ -1,19 +1,19 @@
-// Run with: node stampede-checker.mjs
-// Node 18+ (GitHub Actions already has this)
+// Node 18+ compatible (works with GitHub Actions)
+// Checks Stampede API for availability, pings Discord only when stock changes,
+// and sends a "Still running ✅" ping every 4 hours.
 
 // ====== CONFIG ======
 const ORG    = "b2706404-e8f5-4e57-986d-0769e149bad0";
 const SERIAL = "GJRPJ1VIUNLJ";
 const PS     = 2;                    // party size
-const TZ     = "Europe/London";      // show times in UK time
+const TZ     = "Europe/London";      // timezone for messages
 const DAYS   = 90;                   // how far ahead to scan
-const ONLY_TYPES = [];               // leave [] to include all
 
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK;
 const PROXY_URL = process.env.HTTPS_PROXY;
 
 // ====== HELPERS ======
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+import fs from "fs";
 
 const fmtUKDate = (isoDate) =>
   new Date(`${isoDate}T00:00:00Z`).toLocaleDateString("en-GB", {
@@ -56,10 +56,7 @@ const dateRange = (days) => {
 };
 
 async function sendDiscord(content) {
-  if (!DISCORD_WEBHOOK) {
-    console.error("No Discord webhook configured.");
-    return;
-  }
+  if (!DISCORD_WEBHOOK) return console.error("⚠️ Missing Discord webhook.");
   try {
     await fetch(DISCORD_WEBHOOK, {
       method: "POST",
@@ -80,11 +77,9 @@ async function timesForDate(isoDate) {
   u.searchParams.set("party_size", String(PS));
 
   try {
-    const options = { headers: { "accept": "application/json" } };
-    const res = await fetch(u, options);
+    const res = await fetch(u, { headers: { "accept": "application/json" } });
     if (!res.ok) return [];
     const data = await res.json();
-
     if (Array.isArray(data)) return data;
     if (Array.isArray(data?.times)) return data.times;
     if (Array.isArray(data?.slots)) return data.slots;
@@ -105,18 +100,9 @@ async function timesForDate(isoDate) {
     const slots = await timesForDate(d);
     if (!slots.length) continue;
 
-    let filtered = slots;
-    if (ONLY_TYPES.length) {
-      filtered = slots.filter(s => {
-        const tn = getTypeName(s);
-        return tn && ONLY_TYPES.includes(String(tn));
-      });
-      if (!filtered.length) continue;
-    }
-
-    const typeNames = uniq(filtered.map(getTypeName).map(x => x ?? "_"));
+    const typeNames = uniq(slots.map(getTypeName).map(x => x ?? "_"));
     for (const tn of typeNames) {
-      const bucket = filtered.filter(s => (getTypeName(s) ?? "_") === tn);
+      const bucket = slots.filter(s => (getTypeName(s) ?? "_") === tn);
       const timesUK = bucket
         .map(s => parseTime(d, s))
         .filter(Boolean)
@@ -126,20 +112,45 @@ async function timesForDate(isoDate) {
       if (timesUK.length)
         allAvail.push({ dateUK: fmtUKDate(d), type: tn || "General", times: uniq(timesUK).join(", ") });
     }
-
-    await sleep(200);
   }
 
-  if (!allAvail.length) {
-    console.log("No availability found.");
-    await sendDiscord(`❌ No availability found for the next ${DAYS} days (party size ${PS}).`);
-    return;
+  // Format result for comparison
+  const newSnapshot = JSON.stringify(allAvail, null, 2);
+
+  // ====== LOAD LAST SNAPSHOT ======
+  const lastFile = "last.json";
+  let oldSnapshot = "";
+  if (fs.existsSync(lastFile)) {
+    oldSnapshot = fs.readFileSync(lastFile, "utf8");
   }
 
-  let message = `🎟️ **Availability Found (Party size ${PS})**\n`;
-  for (const a of allAvail)
-    message += `**${a.dateUK}** — ${a.times}${a.type && a.type !== "_" ? ` (${a.type})` : ""}\n`;
+  // ====== SAVE NEW SNAPSHOT ======
+  fs.writeFileSync(lastFile, newSnapshot);
 
-  console.table(allAvail);
-  await sendDiscord(message);
+  // ====== DETECT CHANGES ======
+  const changed = newSnapshot !== oldSnapshot;
+
+  // ====== CHECK KEEPALIVE ======
+  const now = new Date();
+  const hours = now.getHours();
+  const minutes = now.getMinutes();
+  const shouldKeepAlive =
+    (hours % 4 === 0 && minutes < 5); // within 5 minutes of a 4-hour mark
+
+  if (changed && allAvail.length) {
+    let msg = `🎟️ **New availability found (Party size ${PS})**\n`;
+    for (const a of allAvail)
+      msg += `**${a.dateUK}** — ${a.times}${a.type && a.type !== "_" ? ` (${a.type})` : ""}\n`;
+    console.log("New availability found:", allAvail);
+    await sendDiscord(msg);
+  } else if (!allAvail.length && changed) {
+    console.log("Availability disappeared.");
+    await sendDiscord("❌ All availability has been booked or removed.");
+  } else if (shouldKeepAlive) {
+    const msg = `✅ Still running at ${now.toLocaleTimeString("en-GB", { timeZone: TZ })}`;
+    console.log(msg);
+    await sendDiscord(msg);
+  } else {
+    console.log("No changes detected. Still monitoring...");
+  }
 })();
