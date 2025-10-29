@@ -1,20 +1,18 @@
-// Node 18+ compatible (works with GitHub Actions)
-// Checks Stampede API for availability, pings Discord only when stock changes,
-// and sends a "Still running ✅" ping every 4 hours.
+// Node 18+
+// Pings only when NEW slots appear (per-date, per-time, per-type). Persists state in lastSeen.json.
+// Sends "Still running ✅" every 4 hours.
 
-// ====== CONFIG ======
 const ORG    = "b2706404-e8f5-4e57-986d-0769e149bad0";
 const SERIAL = "GJRPJ1VIUNLJ";
-const PS     = 2;                    // party size
-const TZ     = "Europe/London";      // timezone for messages
-const DAYS   = 90;                   // how far ahead to scan
+const PS     = 2;
+const TZ     = "Europe/London";
+const DAYS   = 90;
 
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK;
-const PROXY_URL = process.env.HTTPS_PROXY;
 
-// ====== HELPERS ======
 import fs from "fs";
 
+// ---------- helpers ----------
 const fmtUKDate = (isoDate) =>
   new Date(`${isoDate}T00:00:00Z`).toLocaleDateString("en-GB", {
     weekday: "short", day: "2-digit", month: "short", year: "numeric", timeZone: TZ
@@ -22,56 +20,30 @@ const fmtUKDate = (isoDate) =>
 
 const parseTime = (isoDate, v) => {
   if (!v) return null;
-
-  // Pull a time-like field from a slot object or value.
   const raw = typeof v === "object"
-    ? (
-        v.time ??
-        v.label ??
-        v.start ??                 // some APIs
-        v.start_time ??            // <-- Stampede returns this
-        v.starts_at ??             // snake case alt
-        v.startsAt ??
-        v.startTime ??             // camelCase alt
-        v.datetime ??
-        v.value ??
-        v.slot
-      )
+    ? (v.start_time ?? v.time ?? v.label ?? v.start ?? v.startTime ?? v.starts_at ?? v.startsAt ?? v.datetime ?? v.value ?? v.slot)
     : v;
-
   if (raw == null) return null;
 
-  if (typeof raw === "number") {
-    // seconds vs ms
-    return new Date(raw > 1e12 ? raw : raw * 1000);
-  }
+  if (typeof raw === "number") return new Date(raw > 1e12 ? raw : raw * 1000);
 
   const s = String(raw).trim();
-
-  // Plain "HH:MM" or "HH:MM:SS" — assume it's UTC-ish as the API behaves.
   if (/^\d{2}:\d{2}(:\d{2})?$/.test(s)) {
     const hhmmss = s.length === 5 ? `${s}:00` : s;
     return new Date(`${isoDate}T${hhmmss}Z`);
   }
-
-  // If it looks like an ISO datetime but without Z, append Z.
   const iso = /^\d{4}-\d{2}-\d{2}T/.test(s) ? (s.endsWith("Z") ? s : s + "Z") : s;
   const d = new Date(iso);
   return isNaN(d) ? null : d;
 };
 
-// Try to extract a "type" for grouping if present
 const getTypeName = (slot) =>
+  slot?.booking_type_name ??
   slot?.type?.name ??
   slot?.booking_type?.name ??
-  slot?.bookingType?.name ??
-  slot?.booking_type_name ??      // present in your sample
   slot?.category?.name ??
   slot?.category ??
-  slot?.type ??
-  null;
-
-const uniq = (arr) => [...new Set(arr)];
+  slot?.type ?? null;
 
 const dateRange = (days) => {
   const out = [];
@@ -85,38 +57,45 @@ const dateRange = (days) => {
   return out;
 };
 
-async function sendDiscord(content) {
+// ---------- discord ----------
+async function sendDiscordEmbed(title, lines, ping = false, color = 0x4caf50) {
   if (!DISCORD_WEBHOOK) return console.error("⚠️ Missing Discord webhook.");
+  const payload = {
+    content: ping ? "@here" : undefined, // set true to ping @here
+    embeds: [{
+      title,
+      description: lines.join("\n").slice(0, 1990),
+      color,
+      timestamp: new Date().toISOString(),
+    }],
+  };
   try {
     await fetch(DISCORD_WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content })
+      body: JSON.stringify(payload),
     });
   } catch (e) {
     console.error("Discord send failed:", e.message);
   }
 }
 
-// ====== NETWORK ======
+// ---------- network ----------
 async function timesForDate(isoDate) {
   const u = new URL("https://booking.stampede.ai/api/v2/times");
   u.searchParams.set("org_id", ORG);
   u.searchParams.set("serial", SERIAL);
   u.searchParams.set("date", isoDate);
   u.searchParams.set("party_size", String(PS));
-
   try {
-    const res = await fetch(u, { headers: { "accept": "application/json" } });
+    const res = await fetch(u, { headers: { accept: "application/json" } });
     if (!res.ok) return [];
     const data = await res.json();
-
     if (Array.isArray(data)) return data;
     if (Array.isArray(data?.times)) return data.times;
     if (Array.isArray(data?.slots)) return data.slots;
-
     const candidate = data && typeof data === "object"
-      ? Object.values(data).find(v => Array.isArray(v))
+      ? Object.values(data).find((v) => Array.isArray(v))
       : null;
     return Array.isArray(candidate) ? candidate : [];
   } catch (err) {
@@ -125,69 +104,97 @@ async function timesForDate(isoDate) {
   }
 }
 
-// ====== MAIN ======
+// ---------- main ----------
 (async () => {
   const dates = dateRange(DAYS);
-  const allAvail = [];
 
+  // Build a flat list of *entries* (per slot time), so we can diff precisely.
+  // entryKey format: `${isoDate}|${type || "_"}|${timeHH:MM}`
+  const entries = []; // { isoDate, dateUK, type, timeHM, slotsLeft }
   for (const d of dates) {
     const slots = await timesForDate(d);
     if (!slots.length) continue;
 
-    const typeNames = uniq(slots.map(getTypeName).map(x => x ?? "_"));
+    for (const s of slots) {
+      const dt = parseTime(d, s);
+      if (!dt) continue;
 
-    for (const tn of typeNames) {
-      const bucket = slots.filter(s => (getTypeName(s) ?? "_") === tn);
-      const timesUK = bucket
-        .map(s => parseTime(d, s))
-        .filter(Boolean)
-        .sort((a,b)=>a-b)
-        .map(dt => dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: TZ }));
+      const timeHM = dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
+      const type = getTypeName(s) ?? "_";
+      const slotsLeft = typeof s?.slots_left === "number" ? s.slots_left : undefined;
 
-      if (timesUK.length) {
-        allAvail.push({
-          dateUK: fmtUKDate(d),
-          type: tn || "General",
-          times: uniq(timesUK).join(", ")
-        });
-      }
+      entries.push({
+        isoDate: d,
+        dateUK: fmtUKDate(d),
+        type,
+        timeHM,
+        slotsLeft,
+      });
     }
   }
 
-  // Snapshot for change detection
-  const newSnapshot = JSON.stringify(allAvail, null, 2);
+  // Current set of keys
+  const currentKeys = new Set(entries.map(e => `${e.isoDate}|${e.type}|${e.timeHM}`));
 
-  // ====== LOAD/SAVE SNAPSHOT (works with Actions cache steps) ======
-  const lastFile = "./last.json";
-  let oldSnapshot = "";
-  if (fs.existsSync(lastFile)) {
-    oldSnapshot = fs.readFileSync(lastFile, "utf8");
+  // Load last seen keys
+  const stateFile = "lastSeen.json";
+  let lastKeys = new Set();
+  if (fs.existsSync(stateFile)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      if (Array.isArray(raw?.keys)) lastKeys = new Set(raw.keys);
+    } catch {
+      // ignore corrupt state; treat as empty
+      lastKeys = new Set();
+    }
   }
-  fs.writeFileSync(lastFile, newSnapshot);
 
-  const changed = newSnapshot !== oldSnapshot;
+  // NEW items since the previous run (these are the only ones we’ll ping for)
+  const newKeys = [...currentKeys].filter(k => !lastKeys.has(k));
 
-  // 4-hour keepalive window
+  // Optional: detect "all disappeared" (went from something -> nothing)
+  const disappeared = lastKeys.size > 0 && currentKeys.size === 0;
+
+  // Save state for next run (overwrite with current snapshot)
+  fs.writeFileSync(stateFile, JSON.stringify({ keys: [...currentKeys] }, null, 2));
+
+  // 4-hour keepalive
   const now = new Date();
-  const hours = now.getHours();
-  const minutes = now.getMinutes();
-  const shouldKeepAlive = (hours % 4 === 0 && minutes < 5);
+  const shouldKeepAlive = (now.getHours() % 4 === 0 && now.getMinutes() < 5);
 
-  if (changed && allAvail.length) {
-    let msg = `🎟️ **New availability found (Party size ${PS})**\n`;
-    for (const a of allAvail) {
-      msg += `**${a.dateUK}** — ${a.times}${a.type && a.type !== "_" ? ` (${a.type})` : ""}\n`;
+  if (newKeys.length) {
+    // Create lines grouped by date/type, but only for NEW keys
+    const newSet = new Set(newKeys);
+    const byDateType = new Map(); // key = `${dateUK}|${type}`, val = [times...]
+    for (const e of entries) {
+      const k = `${e.isoDate}|${e.type}|${e.timeHM}`;
+      if (!newSet.has(k)) continue;
+      const labelKey = `${e.dateUK}|${e.type}`;
+      if (!byDateType.has(labelKey)) byDateType.set(labelKey, []);
+      const tag = e.slotsLeft !== undefined ? ` [${e.slotsLeft} left]` : "";
+      byDateType.get(labelKey).push(e.timeHM + tag);
     }
-    console.log("New availability found:", allAvail);
-    await sendDiscord(msg);
-  } else if (!allAvail.length && changed) {
-    console.log("Availability disappeared.");
-    await sendDiscord("❌ All availability has been booked or removed.");
+
+    const lines = [];
+    for (const [labelKey, times] of byDateType.entries()) {
+      const [dateUK, type] = labelKey.split("|");
+      const suffix = (type && type !== "_") ? ` (${type})` : "";
+      // sort and uniq times
+      const uniqTimes = [...new Set(times)].sort();
+      lines.push(`${dateUK} — ${uniqTimes.join(", ")}${suffix}`);
+    }
+
+    console.log("🎟️ New slots:", lines);
+    await sendDiscordEmbed(`🎟️ New availability (Party size ${PS})`, lines, true, 0x00ff66);
+  } else if (disappeared) {
+    // Comment out this whole block if you don't want "all gone" pings
+    console.log("❌ All availability disappeared.");
+    await sendDiscordEmbed("❌ All availability removed", ["Everything booked or unavailable."], false, 0xff0000);
   } else if (shouldKeepAlive) {
     const msg = `✅ Still running at ${now.toLocaleTimeString("en-GB", { timeZone: TZ })}`;
     console.log(msg);
-    await sendDiscord(msg);
+    await sendDiscordEmbed("Keepalive ✅", [msg], false, 0x2196f3);
   } else {
-    console.log("No changes detected. Still monitoring...");
+    console.log("No NEW slots. Still monitoring...");
   }
 })();
