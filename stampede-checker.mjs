@@ -1,6 +1,7 @@
 // Node 18+
-// Pings only when NEW slots appear (per-date, per-time, per-type). Persists state in lastSeen.json.
-// Sends "Still running ✅" every 4 hours.
+// Diff-style alerts: only ping when slots are ADDED or REMOVED.
+// Readable Discord embeds, grouped by date & type. Persist state in lastSeen.json.
+// Sends a keepalive every 4 hours. De-dupes identical notifications for 2 mins.
 
 const ORG    = "b2706404-e8f5-4e57-986d-0769e149bad0";
 const SERIAL = "GJRPJ1VIUNLJ";
@@ -8,9 +9,12 @@ const PS     = 2;
 const TZ     = "Europe/London";
 const DAYS   = 90;
 
+// ---- behaviour ----
+const DEDUPE_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK;
 
 import fs from "fs";
+import crypto from "crypto";
 
 // ---------- helpers ----------
 const fmtUKDate = (isoDate) =>
@@ -57,11 +61,12 @@ const dateRange = (days) => {
   return out;
 };
 
+const slotKey = (isoDate, type, timeHM) => `${isoDate}|${type}|${timeHM}`;
+
 // ---------- discord ----------
-async function sendDiscordEmbed(title, lines, ping = false, color = 0x4caf50) {
-  if (!DISCORD_WEBHOOK) return console.error("⚠️ Missing Discord webhook.");
+async function sendEmbed({ title, lines, color }) {
+  if (!DISCORD_WEBHOOK) return console.error("⚠️ Missing DISCORD_WEBHOOK");
   const payload = {
-    content: ping ? "@here" : undefined, // set true to ping @here
     embeds: [{
       title,
       description: lines.join("\n").slice(0, 1990),
@@ -104,97 +109,110 @@ async function timesForDate(isoDate) {
   }
 }
 
+// Group slot entries into readable lines
+function groupLinesFromKeys(keys, metaMap) {
+  const byLabel = new Map(); // label => Set(times)
+  for (const k of keys) {
+    const m = metaMap.get(k);
+    if (!m) continue;
+    const label = `${m.dateUK}|${m.type}`;
+    if (!byLabel.has(label)) byLabel.set(label, new Set());
+    const tag = typeof m.slotsLeft === "number" ? ` [${m.slotsLeft} left]` : "";
+    byLabel.get(label).add(m.timeHM + tag);
+  }
+  const lines = [];
+  const labels = [...byLabel.keys()].sort();
+  for (const label of labels) {
+    const [dateUK, type] = label.split("|");
+    const suffix = (type && type !== "_") ? ` (${type})` : "";
+    const times = [...byLabel.get(label)].sort();
+    lines.push(`• **${dateUK}** — ${times.join(", ")}${suffix}`);
+  }
+  return lines;
+}
+
 // ---------- main ----------
 (async () => {
   const dates = dateRange(DAYS);
+  const meta = new Map();
+  const currentKeys = new Set();
 
-  // Build a flat list of *entries* (per slot time), so we can diff precisely.
-  // entryKey format: `${isoDate}|${type || "_"}|${timeHH:MM}`
-  const entries = []; // { isoDate, dateUK, type, timeHM, slotsLeft }
   for (const d of dates) {
     const slots = await timesForDate(d);
     if (!slots.length) continue;
-
     for (const s of slots) {
       const dt = parseTime(d, s);
       if (!dt) continue;
-
-      const timeHM = dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
-      const type = getTypeName(s) ?? "_";
+      const timeHM   = dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: TZ });
+      const type     = getTypeName(s) ?? "_";
       const slotsLeft = typeof s?.slots_left === "number" ? s.slots_left : undefined;
-
-      entries.push({
-        isoDate: d,
-        dateUK: fmtUKDate(d),
-        type,
-        timeHM,
-        slotsLeft,
-      });
+      const key = slotKey(d, type, timeHM);
+      currentKeys.add(key);
+      if (!meta.has(key)) {
+        meta.set(key, { isoDate: d, dateUK: fmtUKDate(d), type, timeHM, slotsLeft });
+      }
     }
   }
 
-  // Current set of keys
-  const currentKeys = new Set(entries.map(e => `${e.isoDate}|${e.type}|${e.timeHM}`));
-
-  // Load last seen keys
   const stateFile = "lastSeen.json";
-  let lastKeys = new Set();
+  let state = { keys: [], lastHash: "", lastSentAt: 0 };
   if (fs.existsSync(stateFile)) {
     try {
       const raw = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-      if (Array.isArray(raw?.keys)) lastKeys = new Set(raw.keys);
-    } catch {
-      // ignore corrupt state; treat as empty
-      lastKeys = new Set();
-    }
+      state = { ...state, ...raw };
+    } catch {}
   }
 
-  // NEW items since the previous run (these are the only ones we’ll ping for)
-  const newKeys = [...currentKeys].filter(k => !lastKeys.has(k));
+  const previousKeys = new Set(state.keys || []);
+  const addedKeys   = [...currentKeys].filter(k => !previousKeys.has(k));
+  const removedKeys = [...previousKeys].filter(k => !currentKeys.has(k));
 
-  // Optional: detect "all disappeared" (went from something -> nothing)
-  const disappeared = lastKeys.size > 0 && currentKeys.size === 0;
+  const addedLines   = groupLinesFromKeys(addedKeys, meta);
+  const removedLines = groupLinesFromKeys(removedKeys, meta);
 
-  // Save state for next run (overwrite with current snapshot)
-  fs.writeFileSync(stateFile, JSON.stringify({ keys: [...currentKeys] }, null, 2));
+  const payloadForHash = JSON.stringify({ added: addedLines, removed: removedLines });
+  const notifHash = crypto.createHash("sha1").update(payloadForHash).digest("hex");
+  const nowMs     = Date.now();
+  const withinCooldown = (nowMs - (state.lastSentAt || 0)) < DEDUPE_COOLDOWN_MS;
 
-  // 4-hour keepalive
+  state.keys = [...currentKeys];
   const now = new Date();
   const shouldKeepAlive = (now.getHours() % 4 === 0 && now.getMinutes() < 5);
 
-  if (newKeys.length) {
-    // Create lines grouped by date/type, but only for NEW keys
-    const newSet = new Set(newKeys);
-    const byDateType = new Map(); // key = `${dateUK}|${type}`, val = [times...]
-    for (const e of entries) {
-      const k = `${e.isoDate}|${e.type}|${e.timeHM}`;
-      if (!newSet.has(k)) continue;
-      const labelKey = `${e.dateUK}|${e.type}`;
-      if (!byDateType.has(labelKey)) byDateType.set(labelKey, []);
-      const tag = e.slotsLeft !== undefined ? ` [${e.slotsLeft} left]` : "";
-      byDateType.get(labelKey).push(e.timeHM + tag);
-    }
+  const somethingAdded   = addedLines.length > 0;
+  const somethingRemoved = removedLines.length > 0;
 
-    const lines = [];
-    for (const [labelKey, times] of byDateType.entries()) {
-      const [dateUK, type] = labelKey.split("|");
-      const suffix = (type && type !== "_") ? ` (${type})` : "";
-      // sort and uniq times
-      const uniqTimes = [...new Set(times)].sort();
-      lines.push(`${dateUK} — ${uniqTimes.join(", ")}${suffix}`);
+  if (somethingAdded || somethingRemoved) {
+    if (state.lastHash === notifHash && withinCooldown) {
+      console.log("Duplicate diff within cooldown — skipping send.");
+    } else {
+      if (somethingAdded) {
+        await sendEmbed({
+          title: `🟢 New availability (Party size ${PS})`,
+          lines: addedLines,
+          color: 0x00c853
+        });
+      }
+      if (somethingRemoved) {
+        await sendEmbed({
+          title: `🔴 Removed availability (Party size ${PS})`,
+          lines: removedLines,
+          color: 0xff1744
+        });
+      }
+      state.lastHash   = notifHash;
+      state.lastSentAt = nowMs;
     }
-
-    console.log("🎟️ New slots:", lines);
-    await sendDiscordEmbed(`🎟️ New availability (Party size ${PS})`, lines, true, 0x00ff66);
-  } else if (disappeared) {
-    // Comment out this whole block if you don't want "all gone" pings
-    console.log("❌ All availability disappeared.");
-    await sendDiscordEmbed("❌ All availability removed", ["Everything booked or unavailable."], false, 0xff0000);
   } else if (shouldKeepAlive) {
-    const msg = `✅ Still running at ${now.toLocaleTimeString("en-GB", { timeZone: TZ })}`;
-    console.log(msg);
-    await sendDiscordEmbed("Keepalive ✅", [msg], false, 0x2196f3);
+    const msg = `Still running at ${now.toLocaleTimeString("en-GB", { timeZone: TZ })}`;
+    await sendEmbed({
+      title: "✅ Keepalive",
+      lines: [msg],
+      color: 0x2196f3
+    });
   } else {
-    console.log("No NEW slots. Still monitoring...");
+    console.log("No changes. Still monitoring...");
   }
+
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 })();
