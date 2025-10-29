@@ -22,24 +22,54 @@ const fmtUKDate = (isoDate) =>
 
 const parseTime = (isoDate, v) => {
   if (!v) return null;
+
+  // Pull a time-like field from a slot object or value.
   const raw = typeof v === "object"
-    ? (v.time ?? v.label ?? v.start ?? v.starts_at ?? v.datetime ?? v.value ?? v.slot)
+    ? (
+        v.time ??
+        v.label ??
+        v.start ??                 // some APIs
+        v.start_time ??            // <-- Stampede returns this
+        v.starts_at ??             // snake case alt
+        v.startsAt ??
+        v.startTime ??             // camelCase alt
+        v.datetime ??
+        v.value ??
+        v.slot
+      )
     : v;
-  if (!raw) return null;
+
+  if (raw == null) return null;
+
+  if (typeof raw === "number") {
+    // seconds vs ms
+    return new Date(raw > 1e12 ? raw : raw * 1000);
+  }
 
   const s = String(raw).trim();
+
+  // Plain "HH:MM" or "HH:MM:SS" — assume it's UTC-ish as the API behaves.
   if (/^\d{2}:\d{2}(:\d{2})?$/.test(s)) {
     const hhmmss = s.length === 5 ? `${s}:00` : s;
     return new Date(`${isoDate}T${hhmmss}Z`);
   }
+
+  // If it looks like an ISO datetime but without Z, append Z.
   const iso = /^\d{4}-\d{2}-\d{2}T/.test(s) ? (s.endsWith("Z") ? s : s + "Z") : s;
   const d = new Date(iso);
   return isNaN(d) ? null : d;
 };
 
+// Try to extract a "type" for grouping if present
 const getTypeName = (slot) =>
-  slot?.type?.name ?? slot?.booking_type?.name ?? slot?.category?.name ??
-  slot?.booking_type_name ?? slot?.type ?? null;
+  slot?.type?.name ??
+  slot?.booking_type?.name ??
+  slot?.bookingType?.name ??
+  slot?.booking_type_name ??      // present in your sample
+  slot?.category?.name ??
+  slot?.category ??
+  slot?.type ??
+  null;
 
 const uniq = (arr) => [...new Set(arr)];
 
@@ -80,10 +110,14 @@ async function timesForDate(isoDate) {
     const res = await fetch(u, { headers: { "accept": "application/json" } });
     if (!res.ok) return [];
     const data = await res.json();
+
     if (Array.isArray(data)) return data;
     if (Array.isArray(data?.times)) return data.times;
     if (Array.isArray(data?.slots)) return data.slots;
-    const candidate = Object.values(data).find(v => Array.isArray(v));
+
+    const candidate = data && typeof data === "object"
+      ? Object.values(data).find(v => Array.isArray(v))
+      : null;
     return Array.isArray(candidate) ? candidate : [];
   } catch (err) {
     console.error("Fetch failed for", isoDate, err.message);
@@ -101,6 +135,7 @@ async function timesForDate(isoDate) {
     if (!slots.length) continue;
 
     const typeNames = uniq(slots.map(getTypeName).map(x => x ?? "_"));
+
     for (const tn of typeNames) {
       const bucket = slots.filter(s => (getTypeName(s) ?? "_") === tn);
       const timesUK = bucket
@@ -109,38 +144,40 @@ async function timesForDate(isoDate) {
         .sort((a,b)=>a-b)
         .map(dt => dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: TZ }));
 
-      if (timesUK.length)
-        allAvail.push({ dateUK: fmtUKDate(d), type: tn || "General", times: uniq(timesUK).join(", ") });
+      if (timesUK.length) {
+        allAvail.push({
+          dateUK: fmtUKDate(d),
+          type: tn || "General",
+          times: uniq(timesUK).join(", ")
+        });
+      }
     }
   }
 
-  // Format result for comparison
+  // Snapshot for change detection
   const newSnapshot = JSON.stringify(allAvail, null, 2);
 
-  // ====== LOAD LAST SNAPSHOT ======
-  const lastFile = "last.json";
+  // ====== LOAD/SAVE SNAPSHOT (works with Actions cache steps) ======
+  const lastFile = "./last.json";
   let oldSnapshot = "";
   if (fs.existsSync(lastFile)) {
     oldSnapshot = fs.readFileSync(lastFile, "utf8");
   }
-
-  // ====== SAVE NEW SNAPSHOT ======
   fs.writeFileSync(lastFile, newSnapshot);
 
-  // ====== DETECT CHANGES ======
   const changed = newSnapshot !== oldSnapshot;
 
-  // ====== CHECK KEEPALIVE ======
+  // 4-hour keepalive window
   const now = new Date();
   const hours = now.getHours();
   const minutes = now.getMinutes();
-  const shouldKeepAlive =
-    (hours % 4 === 0 && minutes < 5); // within 5 minutes of a 4-hour mark
+  const shouldKeepAlive = (hours % 4 === 0 && minutes < 5);
 
   if (changed && allAvail.length) {
     let msg = `🎟️ **New availability found (Party size ${PS})**\n`;
-    for (const a of allAvail)
+    for (const a of allAvail) {
       msg += `**${a.dateUK}** — ${a.times}${a.type && a.type !== "_" ? ` (${a.type})` : ""}\n`;
+    }
     console.log("New availability found:", allAvail);
     await sendDiscord(msg);
   } else if (!allAvail.length && changed) {
