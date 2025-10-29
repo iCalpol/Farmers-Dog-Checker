@@ -2,8 +2,11 @@ name: Stampede Checker
 
 on:
   schedule:
-    - cron: "*/2 * * * *"  # every 2 minutes
+    - cron: "*/2 * * * *"   # every 2 minutes
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -11,22 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Restore previous state
-      - name: Restore last snapshot
-        uses: actions/cache@v4
-        with:
-          path: last.json
-          key: stampede-last-state
-
       - name: Run Checker
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
         run: node stampede-checker.mjs
 
-      # Save updated snapshot for next run
-      - name: Save last snapshot
-        uses: actions/cache/save@v4
-        with:
-          path: last.json
-          key: stampede-last-state
+      - name: Commit state if changed (lastSeen.json)
+        run: |
+          set -e
+          if [ ! -f lastSeen.json ]; then
+            echo "No state file; nothing to commit."
+            exit 0
+          fi
+          if git diff --quiet HEAD -- lastSeen.json; then
+            echo "No state change — no commit."
+          else
+            echo "State changed — committing lastSeen.json"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add lastSeen.json
+            git commit -m "state: update lastSeen.json [skip ci]"
+            git push
+          fi
